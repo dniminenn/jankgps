@@ -1,0 +1,17 @@
+[Unit]
+Description=jankgps NEO-M9N GPS daemon
+Before=ts2phc.service
+After=network.target
+ConditionPathExists=/dev/ttyACM0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/jankgps
+RuntimeDirectory=jankgps
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
