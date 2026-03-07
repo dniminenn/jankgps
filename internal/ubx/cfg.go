@@ -14,6 +14,7 @@ const (
 	CfgMsgoutNmeaGsvUSB     uint32 = 0x209100c9 // to disable
 	CfgMsgoutNmeaVtgUSB     uint32 = 0x209100b4 // to disable
 	CfgMsgoutUbxNavPvtUSB   uint32 = 0x20910009
+	CfgMsgoutUbxNavDopUSB   uint32 = 0x2091003b
 	CfgMsgoutUbxNavTimeUSB  uint32 = 0x2091005e
 	CfgMsgoutUbxNavClkUSB   uint32 = 0x20910068
 	CfgMsgoutUbxNavSatUSB   uint32 = 0x20910018
@@ -24,6 +25,12 @@ const (
 	CfgRateMeas    uint32 = 0x30210001 // U2, measurement period ms
 	CfgRateNav     uint32 = 0x30210002 // U2, nav solution ratio
 	CfgRateTimeref uint32 = 0x20210003 // U1, time reference (0=UTC, 1=GPS, ...)
+
+	// NAVSPG - standard precision navigation
+	CfgNavspgDynModel uint32 = 0x20110021 // E1: 0=portable, 2=stationary
+
+	// TP - time pulse
+	CfgTpAntCableDelay uint32 = 0x30050001 // I2, ns
 
 	// USB protocol masks
 	CfgUSBInprotUBX  uint32 = 0x10770001 // L (bool)
@@ -52,6 +59,12 @@ func CfgU1(key uint32, val uint8) cfgItem {
 func CfgU2(key uint32, val uint16) cfgItem {
 	b := make([]byte, 2)
 	binary.LittleEndian.PutUint16(b, val)
+	return cfgItem{Key: key, Val: b}
+}
+
+func CfgI2(key uint32, val int16) cfgItem {
+	b := make([]byte, 2)
+	binary.LittleEndian.PutUint16(b, uint16(val))
 	return cfgItem{Key: key, Val: b}
 }
 

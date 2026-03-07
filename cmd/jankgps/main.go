@@ -14,6 +14,7 @@ import (
 	"github.com/dnim/jankgps/internal/demux"
 	"github.com/dnim/jankgps/internal/export"
 	"github.com/dnim/jankgps/internal/metrics"
+	"github.com/dnim/jankgps/internal/nmea"
 	"github.com/dnim/jankgps/internal/ubx"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -24,8 +25,9 @@ func main() {
 	dev := flag.String("dev", "/dev/ttyACM0", "serial device path")
 	baud := flag.Int("baud", 115200, "serial baud rate")
 	metricsAddr := flag.String("metrics-addr", ":9100", "prometheus metrics listen address")
-	tcpAddr := flag.String("tcp-addr", ":2947", "TCP NMEA export listen address for gpsd")
+	tcpAddr := flag.String("tcp-addr", ":2948", "TCP NMEA export listen address for gpsd")
 	ptyLink := flag.String("pty-link", "/run/jankgps/ts2phc", "symlink path for ts2phc PTY slave")
+	antCableDelayNs := flag.Int("ant-cable-delay-ns", 38, "antenna cable delay in ns for PPS (e.g. ~38 for 25 ft coax)")
 	flag.Parse()
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -40,7 +42,7 @@ func main() {
 	log.Printf("serial: opened %s @ %d baud", *dev, *baud)
 
 	// Configure M9N via VALSET
-	if err := configureModule(port); err != nil {
+	if err := configureModule(port, *antCableDelayNs); err != nil {
 		log.Fatalf("configure: %v", err)
 	}
 
@@ -96,32 +98,34 @@ func main() {
 	}
 }
 
-func configureModule(port serial.Port) error {
-	frame := ubx.EncodeValset(ubx.LayerRAM|ubx.LayerBBR,
+func configureModule(port serial.Port, antCableDelayNs int) error {
+	frame := ubx.EncodeValset(ubx.LayerRAM,
+		ubx.CfgU1(ubx.CfgNavspgDynModel, 2),
+		ubx.CfgI2(ubx.CfgTpAntCableDelay, int16(antCableDelayNs)),
 		// Enable UBX messages on USB at rate 1
 		ubx.CfgU1(ubx.CfgMsgoutUbxNavPvtUSB, 1),
+		ubx.CfgU1(ubx.CfgMsgoutUbxNavDopUSB, 1),
 		ubx.CfgU1(ubx.CfgMsgoutUbxNavTimeUSB, 1),
 		ubx.CfgU1(ubx.CfgMsgoutUbxNavClkUSB, 1),
 		ubx.CfgU1(ubx.CfgMsgoutUbxNavSatUSB, 5), // every 5th solution to reduce volume
 		ubx.CfgU1(ubx.CfgMsgoutUbxTimTpUSB, 1),
-		// Enable RMC on USB, disable chatty NMEA
-		ubx.CfgU1(ubx.CfgMsgoutNmeaRmcUSB, 1),
+		// NMEA off on USB; we generate RMC from UBX
+		ubx.CfgU1(ubx.CfgMsgoutNmeaRmcUSB, 0),
 		ubx.CfgU1(ubx.CfgMsgoutNmeaZdaUSB, 0),
 		ubx.CfgU1(ubx.CfgMsgoutNmeaGgaUSB, 0),
 		ubx.CfgU1(ubx.CfgMsgoutNmeaGllUSB, 0),
 		ubx.CfgU1(ubx.CfgMsgoutNmeaGsaUSB, 0),
 		ubx.CfgU1(ubx.CfgMsgoutNmeaGsvUSB, 0),
 		ubx.CfgU1(ubx.CfgMsgoutNmeaVtgUSB, 0),
-		// Ensure UBX+NMEA output enabled on USB
 		ubx.CfgL(ubx.CfgUSBOutprotUBX, true),
-		ubx.CfgL(ubx.CfgUSBOutprotNMEA, true),
+		ubx.CfgL(ubx.CfgUSBOutprotNMEA, false),
 		ubx.CfgL(ubx.CfgUSBInprotUBX, true),
 	)
 
 	if _, err := port.Write(frame); err != nil {
 		return fmt.Errorf("write VALSET: %w", err)
 	}
-	log.Println("config: sent VALSET (RAM+BBR)")
+	log.Println("config: sent VALSET (RAM)")
 
 	// Wait briefly for ACK; not fatal if we don't see it immediately —
 	// the demux loop will handle ACKs too.
@@ -142,6 +146,8 @@ type handler struct {
 	pty     *export.PTYExport
 	tcp     *export.TCPExport
 	metrics *metrics.Metrics
+	lastDOP *ubx.NavDOP
+	lastSAT *ubx.NavSAT
 }
 
 func (h *handler) OnUBX(frame ubx.Frame) {
@@ -153,6 +159,7 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 			return
 		}
 		h.metrics.UpdateNavPVT(pvt)
+		sendNMEA(h, pvt, h.lastSAT, h.lastDOP)
 
 	case ubx.MsgNavTimeUTC:
 		t, err := ubx.ParseNavTimeUTC(frame.Payload)
@@ -170,6 +177,14 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 		}
 		h.metrics.UpdateNavClock(c)
 
+	case ubx.MsgNavDOP:
+		dop, err := ubx.ParseNavDOP(frame.Payload)
+		if err != nil {
+			log.Printf("parse NAV-DOP: %v", err)
+			return
+		}
+		h.lastDOP = dop
+
 	case ubx.MsgNavSAT:
 		sat, err := ubx.ParseNavSAT(frame.Payload)
 		if err != nil {
@@ -177,6 +192,8 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 			return
 		}
 		h.metrics.UpdateNavSAT(sat)
+		h.lastSAT = sat
+		sendNMEA(h, nil, sat, nil)
 
 	case ubx.MsgTimTP:
 		tp, err := ubx.ParseTimTP(frame.Payload)
@@ -207,9 +224,36 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 	}
 }
 
+func sendNMEA(h *handler, pvt *ubx.NavPVT, sat *ubx.NavSAT, dop *ubx.NavDOP) {
+	if pvt != nil {
+		if b := nmea.GGAFromPVT(pvt, dop); len(b) > 0 {
+			h.tcp.Broadcast(b)
+		}
+		if b := nmea.RMCFromPVT(pvt); len(b) > 0 {
+			h.tcp.Broadcast(b)
+			if err := h.pty.Write(b); err != nil {
+				log.Printf("pty write: %v", err)
+			}
+		}
+		for _, b := range nmea.GSAFromPVT(pvt, sat, dop) {
+			h.tcp.Broadcast(b)
+		}
+		if b := nmea.ZDAFromPVT(pvt); len(b) > 0 {
+			h.tcp.Broadcast(b)
+		}
+		if b := nmea.VTGFromPVT(pvt); len(b) > 0 {
+			h.tcp.Broadcast(b)
+		}
+	}
+	if sat != nil {
+		for _, b := range nmea.GSVFromSAT(sat) {
+			h.tcp.Broadcast(b)
+		}
+	}
+}
+
 func (h *handler) OnNMEA(sentence []byte) {
 	h.tcp.Broadcast(sentence)
-
 	if isRMC(sentence) {
 		if err := h.pty.Write(sentence); err != nil {
 			log.Printf("pty write: %v", err)

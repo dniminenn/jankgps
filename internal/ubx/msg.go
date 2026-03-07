@@ -15,6 +15,7 @@ const (
 	ClassTIM = 0x0d
 
 	IDNavPVT     = 0x07
+	IDNavDOP     = 0x04
 	IDNavTimeUTC = 0x21
 	IDNavClock   = 0x22
 	IDNavSAT     = 0x35
@@ -33,6 +34,7 @@ const (
 // Combined class<<8|id for switch dispatch.
 const (
 	MsgNavPVT     = uint16(ClassNAV)<<8 | IDNavPVT
+	MsgNavDOP     = uint16(ClassNAV)<<8 | IDNavDOP
 	MsgNavTimeUTC = uint16(ClassNAV)<<8 | IDNavTimeUTC
 	MsgNavClock   = uint16(ClassNAV)<<8 | IDNavClock
 	MsgNavSAT     = uint16(ClassNAV)<<8 | IDNavSAT
@@ -121,6 +123,38 @@ func ParseNavPVT(payload []byte) (*NavPVT, error) {
 		Flags3:  payload[78],
 	}
 	return p, nil
+}
+
+// NavDOP is UBX-NAV-DOP (0x01 0x04), 18 bytes.
+type NavDOP struct {
+	ITOW uint32
+	GDOP uint16 // 0.01
+	PDOP uint16
+	TDOP uint16
+	VDOP uint16
+	HDOP uint16
+	NDOP uint16
+	EDOP uint16
+}
+
+func (d *NavDOP) HDOPVal() float64 { return float64(d.HDOP) * 0.01 }
+func (d *NavDOP) VDOPVal() float64 { return float64(d.VDOP) * 0.01 }
+func (d *NavDOP) PDOPVal() float64 { return float64(d.PDOP) * 0.01 }
+
+func ParseNavDOP(payload []byte) (*NavDOP, error) {
+	if len(payload) < 18 {
+		return nil, fmt.Errorf("ubx: NAV-DOP payload too short: %d", len(payload))
+	}
+	return &NavDOP{
+		ITOW: binary.LittleEndian.Uint32(payload[0:4]),
+		GDOP: binary.LittleEndian.Uint16(payload[4:6]),
+		PDOP: binary.LittleEndian.Uint16(payload[6:8]),
+		TDOP: binary.LittleEndian.Uint16(payload[8:10]),
+		VDOP: binary.LittleEndian.Uint16(payload[10:12]),
+		HDOP: binary.LittleEndian.Uint16(payload[12:14]),
+		NDOP: binary.LittleEndian.Uint16(payload[14:16]),
+		EDOP: binary.LittleEndian.Uint16(payload[16:18]),
+	}, nil
 }
 
 // NavTimeUTC is UBX-NAV-TIMEUTC (0x01 0x21), 20 bytes.

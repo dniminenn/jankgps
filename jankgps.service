@@ -1,6 +1,6 @@
 [Unit]
 Description=jankgps NEO-M9N GPS daemon
-Before=ts2phc.service
+Before=ts2phc.service gpsd.service
 After=network.target
 ConditionPathExists=/dev/ttyACM0
 
