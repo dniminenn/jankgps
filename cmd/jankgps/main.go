@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -15,74 +14,144 @@ import (
 	"github.com/dnim/jankgps/internal/export"
 	"github.com/dnim/jankgps/internal/metrics"
 	"github.com/dnim/jankgps/internal/nmea"
+	"github.com/dnim/jankgps/internal/ts2phc"
 	"github.com/dnim/jankgps/internal/ubx"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"go.bug.st/serial"
 )
 
+var (
+	cfgFile string
+	root   = &cobra.Command{
+		Use:   "jankgps",
+		Short: "GPS daemon with NMEA/UBX demux, PTY for ts2phc, TCP for gpsd",
+		RunE:  run,
+	}
+)
+
+func init() {
+	cobra.OnInitialize(initConfig)
+	root.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default $HOME/.jankgps.yaml)")
+	root.PersistentFlags().String("dev", "/dev/ttyACM0", "serial device path")
+	root.PersistentFlags().Int("baud", 115200, "serial baud rate")
+	root.PersistentFlags().String("metrics-addr", ":9100", "prometheus metrics listen address")
+	root.PersistentFlags().String("tcp-addr", ":2948", "TCP NMEA export listen address for gpsd")
+	root.PersistentFlags().String("pty-link", "/run/jankgps/ts2phc", "symlink path for ts2phc PTY slave")
+	root.PersistentFlags().Int("ant-cable-delay-ns", 38, "antenna cable delay in ns for PPS")
+	root.PersistentFlags().Bool("pty", true, "enable PTY export for ts2phc")
+	root.PersistentFlags().Bool("tcp", true, "enable TCP NMEA export for gpsd")
+	root.PersistentFlags().Bool("metrics", true, "enable Prometheus metrics server")
+	root.PersistentFlags().Bool("monitor-ts2phc", true, "monitor ts2phc journal logs for metrics")
+	_ = viper.BindPFlag("dev", root.PersistentFlags().Lookup("dev"))
+	_ = viper.BindPFlag("baud", root.PersistentFlags().Lookup("baud"))
+	_ = viper.BindPFlag("metrics_addr", root.PersistentFlags().Lookup("metrics-addr"))
+	_ = viper.BindPFlag("tcp_addr", root.PersistentFlags().Lookup("tcp-addr"))
+	_ = viper.BindPFlag("pty_link", root.PersistentFlags().Lookup("pty-link"))
+	_ = viper.BindPFlag("ant_cable_delay_ns", root.PersistentFlags().Lookup("ant-cable-delay-ns"))
+	_ = viper.BindPFlag("pty", root.PersistentFlags().Lookup("pty"))
+	_ = viper.BindPFlag("tcp", root.PersistentFlags().Lookup("tcp"))
+	_ = viper.BindPFlag("metrics", root.PersistentFlags().Lookup("metrics"))
+	_ = viper.BindPFlag("monitor_ts2phc", root.PersistentFlags().Lookup("monitor-ts2phc"))
+}
+
+func initConfig() {
+	if cfgFile != "" {
+		viper.SetConfigFile(cfgFile)
+	} else {
+		home, _ := os.UserHomeDir()
+		viper.AddConfigPath(home)
+		viper.SetConfigType("yaml")
+		viper.SetConfigName(".jankgps")
+	}
+	viper.SetEnvPrefix("JANKGPS")
+	viper.AutomaticEnv()
+	_ = viper.ReadInConfig()
+}
+
 func main() {
-	dev := flag.String("dev", "/dev/ttyACM0", "serial device path")
-	baud := flag.Int("baud", 115200, "serial baud rate")
-	metricsAddr := flag.String("metrics-addr", ":9100", "prometheus metrics listen address")
-	tcpAddr := flag.String("tcp-addr", ":2948", "TCP NMEA export listen address for gpsd")
-	ptyLink := flag.String("pty-link", "/run/jankgps/ts2phc", "symlink path for ts2phc PTY slave")
-	antCableDelayNs := flag.Int("ant-cable-delay-ns", 38, "antenna cable delay in ns for PPS (e.g. ~38 for 25 ft coax)")
-	flag.Parse()
-
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	if err := root.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
 
-	// Open serial port
-	port, err := serial.Open(*dev, &serial.Mode{BaudRate: *baud})
+func run(cmd *cobra.Command, args []string) error {
+	dev := viper.GetString("dev")
+	baud := viper.GetInt("baud")
+	metricsAddr := viper.GetString("metrics_addr")
+	tcpAddr := viper.GetString("tcp_addr")
+	ptyLink := viper.GetString("pty_link")
+	antCableDelayNs := viper.GetInt("ant_cable_delay_ns")
+	enablePTY := viper.GetBool("pty")
+	enableTCP := viper.GetBool("tcp")
+	enableMetrics := viper.GetBool("metrics")
+	monitorTS2PHC := viper.GetBool("monitor_ts2phc")
+
+	port, err := serial.Open(dev, &serial.Mode{BaudRate: baud})
 	if err != nil {
-		log.Fatalf("serial open %s: %v", *dev, err)
+		return fmt.Errorf("serial open %s: %w", dev, err)
 	}
 	defer port.Close()
 	port.SetReadTimeout(2 * time.Second)
-	log.Printf("serial: opened %s @ %d baud", *dev, *baud)
+	log.Printf("serial: opened %s @ %d baud", dev, baud)
 
-	// Configure M9N via VALSET
-	if err := configureModule(port, *antCableDelayNs); err != nil {
-		log.Fatalf("configure: %v", err)
+	if err := configureModule(port, antCableDelayNs); err != nil {
+		return fmt.Errorf("configure: %w", err)
 	}
 
-	// Poll MON-VER for firmware info
 	if _, err := port.Write(ubx.EncodePoll(ubx.ClassMON, ubx.IDMonVer)); err != nil {
 		log.Printf("warn: failed to poll MON-VER: %v", err)
 	}
 
-	// Set up exports
-	ptyExport, err := export.NewPTY(*ptyLink)
-	if err != nil {
-		log.Fatalf("pty: %v", err)
-	}
-	defer ptyExport.Close()
-
-	tcpExport, err := export.NewTCP(*tcpAddr)
-	if err != nil {
-		log.Fatalf("tcp: %v", err)
-	}
-	defer tcpExport.Close()
-
-	// Prometheus
-	reg := prometheus.NewRegistry()
-	met := metrics.New(reg)
-	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	go func() {
-		log.Printf("metrics: listening on %s", *metricsAddr)
-		if err := http.ListenAndServe(*metricsAddr, nil); err != nil {
-			log.Fatalf("metrics http: %v", err)
+	var ptyExport *export.PTYExport
+	if enablePTY {
+		ptyExport, err = export.NewPTY(ptyLink)
+		if err != nil {
+			return fmt.Errorf("pty: %w", err)
 		}
-	}()
+		defer ptyExport.Close()
+	}
 
-	// Wire up handler
+	var tcpExport *export.TCPExport
+	if enableTCP {
+		tcpExport, err = export.NewTCP(tcpAddr)
+		if err != nil {
+			return fmt.Errorf("tcp: %w", err)
+		}
+		defer tcpExport.Close()
+	}
+
+	var met *metrics.Metrics
+	if enableMetrics {
+		reg := prometheus.NewRegistry()
+		met = metrics.New(reg)
+		http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+		go func() {
+			log.Printf("metrics: listening on %s", metricsAddr)
+			if err := http.ListenAndServe(metricsAddr, nil); err != nil {
+				log.Printf("metrics http: %v", err)
+			}
+		}()
+
+		if monitorTS2PHC {
+			mon := ts2phc.NewMonitor(met)
+			go func() {
+				if err := mon.Run(cmd.Context()); err != nil {
+					log.Printf("ts2phc monitor: %v", err)
+				}
+			}()
+		}
+	}
+
 	h := &handler{
 		pty:     ptyExport,
 		tcp:     tcpExport,
 		metrics: met,
 	}
 
-	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -91,25 +160,20 @@ func main() {
 		port.Close()
 	}()
 
-	// Run demuxer (blocks until port closes or error)
 	d := demux.New(port, h)
-	if err := d.Run(); err != nil {
-		log.Printf("demux: %v", err)
-	}
+	return d.Run()
 }
 
 func configureModule(port serial.Port, antCableDelayNs int) error {
 	frame := ubx.EncodeValset(ubx.LayerRAM,
 		ubx.CfgU1(ubx.CfgNavspgDynModel, 2),
 		ubx.CfgI2(ubx.CfgTpAntCableDelay, int16(antCableDelayNs)),
-		// Enable UBX messages on USB at rate 1
 		ubx.CfgU1(ubx.CfgMsgoutUbxNavPvtUSB, 1),
 		ubx.CfgU1(ubx.CfgMsgoutUbxNavDopUSB, 1),
 		ubx.CfgU1(ubx.CfgMsgoutUbxNavTimeUSB, 1),
 		ubx.CfgU1(ubx.CfgMsgoutUbxNavClkUSB, 1),
-		ubx.CfgU1(ubx.CfgMsgoutUbxNavSatUSB, 5), // every 5th solution to reduce volume
+		ubx.CfgU1(ubx.CfgMsgoutUbxNavSatUSB, 5),
 		ubx.CfgU1(ubx.CfgMsgoutUbxTimTpUSB, 1),
-		// NMEA off on USB; we generate RMC from UBX
 		ubx.CfgU1(ubx.CfgMsgoutNmeaRmcUSB, 0),
 		ubx.CfgU1(ubx.CfgMsgoutNmeaZdaUSB, 0),
 		ubx.CfgU1(ubx.CfgMsgoutNmeaGgaUSB, 0),
@@ -127,8 +191,6 @@ func configureModule(port serial.Port, antCableDelayNs int) error {
 	}
 	log.Println("config: sent VALSET (RAM)")
 
-	// Wait briefly for ACK; not fatal if we don't see it immediately —
-	// the demux loop will handle ACKs too.
 	time.Sleep(200 * time.Millisecond)
 	buf := make([]byte, 256)
 	n, _ := port.Read(buf)
@@ -158,7 +220,9 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 			log.Printf("parse NAV-PVT: %v", err)
 			return
 		}
-		h.metrics.UpdateNavPVT(pvt)
+		if h.metrics != nil {
+			h.metrics.UpdateNavPVT(pvt)
+		}
 		sendNMEA(h, pvt, h.lastSAT, h.lastDOP)
 
 	case ubx.MsgNavTimeUTC:
@@ -167,7 +231,9 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 			log.Printf("parse NAV-TIMEUTC: %v", err)
 			return
 		}
-		h.metrics.UpdateNavTimeUTC(t)
+		if h.metrics != nil {
+			h.metrics.UpdateNavTimeUTC(t)
+		}
 
 	case ubx.MsgNavClock:
 		c, err := ubx.ParseNavClock(frame.Payload)
@@ -175,7 +241,9 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 			log.Printf("parse NAV-CLOCK: %v", err)
 			return
 		}
-		h.metrics.UpdateNavClock(c)
+		if h.metrics != nil {
+			h.metrics.UpdateNavClock(c)
+		}
 
 	case ubx.MsgNavDOP:
 		dop, err := ubx.ParseNavDOP(frame.Payload)
@@ -184,6 +252,9 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 			return
 		}
 		h.lastDOP = dop
+		if h.metrics != nil {
+			h.metrics.UpdateNavDOP(dop)
+		}
 
 	case ubx.MsgNavSAT:
 		sat, err := ubx.ParseNavSAT(frame.Payload)
@@ -191,7 +262,9 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 			log.Printf("parse NAV-SAT: %v", err)
 			return
 		}
-		h.metrics.UpdateNavSAT(sat)
+		if h.metrics != nil {
+			h.metrics.UpdateNavSAT(sat)
+		}
 		h.lastSAT = sat
 		sendNMEA(h, nil, sat, nil)
 
@@ -201,7 +274,9 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 			log.Printf("parse TIM-TP: %v", err)
 			return
 		}
-		h.metrics.UpdateTimTP(tp)
+		if h.metrics != nil {
+			h.metrics.UpdateTimTP(tp)
+		}
 
 	case ubx.MsgMonVer:
 		ver, err := ubx.ParseMonVer(frame.Payload)
@@ -225,36 +300,51 @@ func (h *handler) OnUBX(frame ubx.Frame) {
 }
 
 func sendNMEA(h *handler, pvt *ubx.NavPVT, sat *ubx.NavSAT, dop *ubx.NavDOP) {
-	if pvt != nil {
-		if b := nmea.GGAFromPVT(pvt, dop); len(b) > 0 {
+	if h.tcp == nil && h.pty == nil {
+		return
+	}
+	broadcast := func(b []byte) {
+		if h.tcp != nil && len(b) > 0 {
 			h.tcp.Broadcast(b)
 		}
-		if b := nmea.RMCFromPVT(pvt); len(b) > 0 {
-			h.tcp.Broadcast(b)
+	}
+	ptyWrite := func(b []byte) {
+		if h.pty != nil && len(b) > 0 {
 			if err := h.pty.Write(b); err != nil {
 				log.Printf("pty write: %v", err)
 			}
 		}
+	}
+	if pvt != nil {
+		if b := nmea.GGAFromPVT(pvt, dop); len(b) > 0 {
+			broadcast(b)
+		}
+		if b := nmea.RMCFromPVT(pvt); len(b) > 0 {
+			broadcast(b)
+			ptyWrite(b)
+		}
 		for _, b := range nmea.GSAFromPVT(pvt, sat, dop) {
-			h.tcp.Broadcast(b)
+			broadcast(b)
 		}
 		if b := nmea.ZDAFromPVT(pvt); len(b) > 0 {
-			h.tcp.Broadcast(b)
+			broadcast(b)
 		}
 		if b := nmea.VTGFromPVT(pvt); len(b) > 0 {
-			h.tcp.Broadcast(b)
+			broadcast(b)
 		}
 	}
 	if sat != nil {
 		for _, b := range nmea.GSVFromSAT(sat) {
-			h.tcp.Broadcast(b)
+			broadcast(b)
 		}
 	}
 }
 
 func (h *handler) OnNMEA(sentence []byte) {
-	h.tcp.Broadcast(sentence)
-	if isRMC(sentence) {
+	if h.tcp != nil {
+		h.tcp.Broadcast(sentence)
+	}
+	if h.pty != nil && isRMC(sentence) {
 		if err := h.pty.Write(sentence); err != nil {
 			log.Printf("pty write: %v", err)
 		}

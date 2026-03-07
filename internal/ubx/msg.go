@@ -3,6 +3,7 @@ package ubx
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -137,9 +138,9 @@ type NavDOP struct {
 	EDOP uint16
 }
 
-func (d *NavDOP) HDOPVal() float64 { return float64(d.HDOP) * 0.01 }
-func (d *NavDOP) VDOPVal() float64 { return float64(d.VDOP) * 0.01 }
-func (d *NavDOP) PDOPVal() float64 { return float64(d.PDOP) * 0.01 }
+func (d *NavDOP) HDOPVal() float64 { return math.Round(float64(d.HDOP)*0.01*100) / 100 }
+func (d *NavDOP) VDOPVal() float64 { return math.Round(float64(d.VDOP)*0.01*100) / 100 }
+func (d *NavDOP) PDOPVal() float64 { return math.Round(float64(d.PDOP)*0.01*100) / 100 }
 
 func ParseNavDOP(payload []byte) (*NavDOP, error) {
 	if len(payload) < 18 {
