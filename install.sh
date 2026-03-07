@@ -3,10 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "building jankgps..."
 cd "$SCRIPT_DIR"
-make build
-
 echo "installing binary to /usr/local/bin/"
 install -m 0755 bin/jankgps /usr/local/bin/jankgps
 
